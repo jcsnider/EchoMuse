@@ -1,18 +1,29 @@
 package server
 
 import (
+	"errors"
 	"log"
 	"sync"
+	"time"
 
 	internalLed "github.com/wilbowes/EchoMuse/internal/bindings/led"
 	"github.com/wilbowes/EchoMuse/internal/bindings/mixer"
+	"github.com/wilbowes/EchoMuse/internal/bindings/privacy"
 	"github.com/wilbowes/EchoMuse/pkg/led"
 )
 
 type muteController struct {
-	mu      sync.Mutex
-	muted   bool
-	ledCtrl func() led.Controller
+	hardware          kernelPrivacy
+	transitionMu      sync.Mutex
+	restoringHardware bool
+	hardwareError     string
+	restoreDone       chan struct{}
+	restoreError      error // published by closing restoreDone
+	restoreStarted    time.Time
+	restoreTimedOut   bool
+	mu                sync.Mutex
+	muted             bool
+	ledCtrl           func() led.Controller
 	// dotMuted is set externally to block dot button events while muted
 	onMuteChange func(muted bool)
 	// persist, when set, is called after every Toggle() so the mute state
@@ -22,11 +33,20 @@ type muteController struct {
 	persist func()
 }
 
+type kernelPrivacy interface {
+	State() (bool, error)
+	RequestMute() error
+}
+
 func newMuteController(ledGetter func() led.Controller, onMuteChange func(muted bool)) *muteController {
-	return &muteController{
+	m := &muteController{
 		ledCtrl:      ledGetter,
 		onMuteChange: onMuteChange,
 	}
+	if privacy.Present() {
+		m.hardware = &privacy.Device{Path: privacy.Path}
+	}
+	return m
 }
 
 // SetOnMuteChange wires a callback invoked when mute state changes.
@@ -47,9 +67,26 @@ func (m *muteController) IsMuted() bool {
 }
 
 func (m *muteController) Toggle() {
+	if m.hardware != nil {
+		// The kernel already handles this physical press (including delayed
+		// work). Its poller will reconcile; a second independent toggle is
+		// exactly what inverted Radar's button and application state.
+		return
+	}
+	m.transitionMu.Lock()
+	defer m.transitionMu.Unlock()
+	m.setMuted(!m.IsMuted())
+}
+
+// setMuted runs with transitionMu held, serialising hardware, LEDs, persisted
+// state and callbacks rather than only protecting the in-memory flag.
+func (m *muteController) setMuted(muted bool) {
 	m.mu.Lock()
-	m.muted = !m.muted
-	muted := m.muted
+	if m.muted == muted {
+		m.mu.Unlock()
+		return
+	}
+	m.muted = muted
 	// Copy under the lock — SetOnMuteChange writes this field under mu from
 	// the main goroutine, and button events can fire before that wiring
 	// completes (SubscribeToButton starts the evdev goroutines first).
@@ -68,6 +105,56 @@ func (m *muteController) Toggle() {
 
 	if cb != nil {
 		cb(muted)
+	}
+}
+
+func (m *muteController) syncHardware() {
+	m.transitionMu.Lock()
+	defer m.transitionMu.Unlock()
+	if m.restoreDone != nil {
+		select {
+		case <-m.restoreDone:
+			if m.restoreError != nil {
+				log.Printf("Mute: hardware restore failed; retaining software mute: %v", m.restoreError)
+			}
+			m.restoreDone = nil
+		default:
+			if !m.restoreTimedOut && time.Since(m.restoreStarted) >= 2*time.Second {
+				log.Print("Mute: hardware restore still blocked after 2s; mic remains muted, controller recovery stays available")
+				m.restoreTimedOut = true
+			}
+			return
+		}
+	}
+	muted, err := m.hardware.State()
+	if err != nil {
+		if !errors.Is(err, privacy.ErrPending) && err.Error() != m.hardwareError {
+			log.Printf("Mute: privacy read failed; keeping mic muted: %v", err)
+			m.hardwareError = err.Error()
+		}
+		m.setMuted(true)
+		return
+	}
+	m.hardwareError = ""
+	if m.restoringHardware {
+		if !muted {
+			return
+		} // write acceptance alone must not release saved mute
+		m.restoringHardware = false
+	}
+	m.setMuted(muted)
+}
+
+// Process-lifetime poller: kernel privacy can change after the release event
+// (300ms delayed work), or while application state was being restored.
+func (m *muteController) watchHardware() {
+	if m.hardware == nil {
+		return
+	}
+	ticker := time.NewTicker(100 * time.Millisecond)
+	defer ticker.Stop()
+	for range ticker.C {
+		m.syncHardware()
 	}
 }
 
@@ -102,25 +189,50 @@ func setAdcMute(val string) {
 // LED-init goroutine finishes), so the red ring and button LED are painted
 // by that goroutine once the controllers exist.
 func (m *muteController) RestoreMuted() {
+	m.transitionMu.Lock()
+	defer m.transitionMu.Unlock()
 	m.mu.Lock()
 	m.muted = true
 	m.mu.Unlock()
 	log.Println("Mute: restoring persisted muted state")
 	setAdcMute("1")
+	if m.hardware != nil {
+		m.restoringHardware = true
+		if muted, err := m.hardware.State(); err == nil && muted {
+			m.restoringHardware = false
+		} else {
+			// Some kernels wait indefinitely inside this sysfs write for a
+			// hardware latch. Never hold startup or transitionMu hostage.
+			// One request only; software stays closed until it finishes and
+			// the poller confirms the hardware state. A pending write must
+			// not outlive a software unmute and reassert privacy afterward.
+			m.restoreStarted = time.Now()
+			m.restoreDone = make(chan struct{})
+			done := m.restoreDone
+			go func() {
+				m.restoreError = m.hardware.RequestMute()
+				close(done)
+			}()
+		}
+	}
 }
 
 func (m *muteController) applyMute() {
 	log.Println("Mute: mic muted")
 	setAdcMute("1")
 	m.showMuteLEDs()
-	setMuteButtonLED(true)
+	if m.hardware == nil {
+		setMuteButtonLED(true)
+	}
 }
 
 func (m *muteController) applyUnmute() {
 	log.Println("Mute: mic unmuted")
 	setAdcMute("0")
 	m.clearLEDs()
-	setMuteButtonLED(false)
+	if m.hardware == nil {
+		setMuteButtonLED(false)
+	}
 }
 
 // setMuteButtonLED drives the discrete red LED under the mic-off button —

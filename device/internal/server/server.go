@@ -12,7 +12,6 @@ import (
 	"github.com/wilbowes/EchoMuse/pkg/led"
 	"github.com/wilbowes/EchoMuse/pkg/mic"
 	"github.com/wilbowes/EchoMuse/pkg/speaker"
-	"golang.org/x/sys/unix"
 )
 
 // ledMode controls which subsystem currently owns the LED ring.
@@ -108,10 +107,20 @@ func NewServer(buttonController buttons.Controller, microphone mic.Microphone, s
 	// it must come back with or without a controller.
 	if st, ok := loadDeviceState(statePath); ok && st.Muted {
 		server.mute.RestoreMuted() // ADC only; LEDs painted after init below
+	} else if server.mute.hardware != nil {
+		// Start closed until the kernel gives a usable state. A stale saved
+		// "unmuted" must never override an active hardware privacy latch.
+		server.mute.muted = true
+		setAdcMute("1")
+		server.mute.syncHardware()
 	}
 	server.mute.persist = func() {
 		saveDeviceState(statePath, deviceState{Muted: server.mute.IsMuted()})
 	}
+	if server.mute.hardware != nil {
+		server.mute.persist() // retain a kernel mute found on an otherwise unmuted boot
+	}
+	go server.mute.watchHardware()
 
 	go func() {
 		uptime, err := getUptime()
@@ -130,6 +139,11 @@ func NewServer(buttonController buttons.Controller, microphone mic.Microphone, s
 			log.Fatalf("Failed to initialize LED controller: %v", err)
 		}
 
+		// Publishing/clearing the new ring and repainting mute must be one
+		// transition; otherwise the privacy poller can paint red just before
+		// startup clears it, leaving the ring wrong until the next press.
+		server.mute.transitionMu.Lock()
+		defer server.mute.transitionMu.Unlock()
 		server.ledMu.Lock()
 		server.ledController = ledController
 		server.ledMu.Unlock()
@@ -138,8 +152,10 @@ func NewServer(buttonController buttons.Controller, microphone mic.Microphone, s
 		// Discrete red LED under the mic-off button (GPIO, separate from
 		// the ring) — export + off. Non-fatal: an unmuted boot without a
 		// button LED is cosmetic, everything else still works.
-		if err := internalLed.InitMuteButtonLED(); err != nil {
-			log.Printf("Mute button LED init failed: %v", err)
+		if server.mute.hardware == nil {
+			if err := internalLed.InitMuteButtonLED(); err != nil {
+				log.Printf("Mute button LED init failed: %v", err)
+			}
 		}
 
 		// A muted state restored from state.json was applied to the ADC
@@ -147,7 +163,9 @@ func NewServer(buttonController buttons.Controller, microphone mic.Microphone, s
 		// button LED now.
 		if server.mute.IsMuted() {
 			server.mute.showMuteLEDs()
-			setMuteButtonLED(true)
+			if server.mute.hardware == nil {
+				setMuteButtonLED(true)
+			}
 		}
 	}()
 
@@ -310,14 +328,6 @@ func clearLeds(ledController led.Controller) {
 	if err = ledController.SetLEDs(leds...); err != nil {
 		log.Printf("clearLeds: failed to set LEDs: %v", err)
 	}
-}
-
-func getUptime() (time.Duration, error) {
-	var info unix.Sysinfo_t
-	if err := unix.Sysinfo(&info); err != nil {
-		return time.Duration(0), err
-	}
-	return time.Second * time.Duration(info.Uptime), nil
 }
 
 // SetLEDMode sets the current LED priority mode.
